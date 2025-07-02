@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""
+Standalone script to compare Berachain RewardVaults with InfraredVaults.
+
+This script fetches all reward vaults from both APIs and shows which 
+Berachain vaults have corresponding Infrared vaults.
+"""
+
+import requests
+import json
+from typing import List, Dict, Any, Optional
+
+# API Configuration
+BERACHAIN_API_URL = "https://api.berachain.com/"
+INFRARED_SUBGRAPH_URL = "https://api.goldsky.com/api/public/project_cm0l6u51qaa1c01xyc2rj7a6d/subgraphs/infrared-mainnet/1.0.1/gn"
+CHAIN_NAME = "BERACHAIN"
+PAGE_SIZE = 100
+
+def fetch_berachain_reward_vaults() -> List[Dict[str, Any]]:
+    """Fetch all reward vaults from Berachain API."""
+    query = """
+    query GqlRewardVault($chain: GqlChain!) {
+        polGetRewardVaults(chain: $chain) {
+            vaults {
+                vaultAddress
+                isVaultWhitelisted
+                stakingTokenAddress
+                stakingToken {
+                    address
+                    name
+                }
+            }
+        }
+    }
+    """
+    
+    variables = {"chain": CHAIN_NAME}
+    payload = {"query": query, "variables": variables}
+    
+    try:
+        response = requests.post(BERACHAIN_API_URL, json=payload, timeout=30)
+        response.raise_for_status()
+        
+        data = response.json()
+        if "data" in data and "polGetRewardVaults" in data["data"]:
+            return data["data"]["polGetRewardVaults"]["vaults"]
+        else:
+            print(f"Unexpected Berachain API response: {data}")
+            return []
+            
+    except Exception as e:
+        print(f"Error fetching Berachain vaults: {e}")
+        return []
+
+def fetch_infrared_vaults_page(first: int = PAGE_SIZE, skip: int = 0) -> List[Dict[str, Any]]:
+    """Fetch a page of Infrared vaults."""
+    query = """
+    {
+      vaults(first: %d, skip: %d) {
+        id
+        berachainVaultAddress
+        stakeToken {
+          name
+          symbol
+        }
+      }
+    }
+    """ % (first, skip)
+    
+    try:
+        response = requests.post(
+            INFRARED_SUBGRAPH_URL,
+            json={"query": query},
+            timeout=30
+        )
+        response.raise_for_status()
+        
+        data = response.json()
+        if "data" in data and "vaults" in data["data"]:
+            return data["data"]["vaults"]
+        else:
+            print(f"Unexpected Infrared API response: {data}")
+            return []
+            
+    except Exception as e:
+        print(f"Error fetching Infrared vaults: {e}")
+        return []
+
+def fetch_all_infrared_vaults() -> List[Dict[str, Any]]:
+    """Fetch all Infrared vaults using pagination."""
+    all_vaults = []
+    skip = 0
+    
+    print("Fetching Infrared vaults...")
+    
+    while True:
+        vaults = fetch_infrared_vaults_page(PAGE_SIZE, skip)
+        
+        if not vaults:
+            break
+            
+        all_vaults.extend(vaults)
+        print(f"  Fetched {len(vaults)} vaults (total: {len(all_vaults)})")
+        
+        if len(vaults) < PAGE_SIZE:
+            break
+            
+        skip += PAGE_SIZE
+    
+    print(f"Total Infrared vaults: {len(all_vaults)}")
+    return all_vaults
+
+def compare_vaults():
+    """Compare Berachain RewardVaults with InfraredVaults."""
+    print("=== Berachain RewardVault vs InfraredVault Comparison ===\n")
+    
+    # Fetch data from both APIs
+    print("Fetching Berachain reward vaults...")
+    berachain_vaults = fetch_berachain_reward_vaults()
+    print(f"Found {len(berachain_vaults)} Berachain reward vaults\n")
+    
+    infrared_vaults = fetch_all_infrared_vaults()
+    print(f"Found {len(infrared_vaults)} Infrared vaults\n")
+    
+    # Create lookup dict for Infrared vaults by Berachain vault address
+    infrared_lookup = {}
+    for ir_vault in infrared_vaults:
+        berachain_addr = ir_vault.get("berachainVaultAddress", "").lower()
+        if berachain_addr:
+            infrared_lookup[berachain_addr] = ir_vault
+    
+    print("=== COMPARISON RESULTS ===\n")
+    print(f"{'Berachain Vault':<45} {'IR Vault':<45} {'Has IR Vault':<12} {'Berachain Name':<30} {'IR Name'}")
+    print("-" * 150)
+    
+    # Track statistics
+    total_berachain = len(berachain_vaults)
+    has_ir_vault = 0
+    whitelisted_with_ir = 0
+    whitelisted_total = 0
+    
+    # Sort Berachain vaults by whether they have IR coverage (IR vaults first)
+    def sort_key(vault):
+        vault_addr = vault.get("vaultAddress", "").lower()
+        has_ir = vault_addr in infrared_lookup
+        is_whitelisted = vault.get("isVaultWhitelisted", False)
+        # Sort by: has_ir (desc), is_whitelisted (desc), address
+        return (not has_ir, not is_whitelisted, vault_addr)
+    
+    sorted_vaults = sorted(berachain_vaults, key=sort_key)
+    
+    for vault in sorted_vaults:
+        vault_addr = vault.get("vaultAddress", "").lower()
+        vault_name = vault.get("stakingToken", {}).get("name", "Unknown")
+        is_whitelisted = vault.get("isVaultWhitelisted", False)
+        
+        if is_whitelisted:
+            whitelisted_total += 1
+        
+        # Check if this Berachain vault has a corresponding IR vault
+        ir_vault = infrared_lookup.get(vault_addr)
+        
+        if ir_vault:
+            has_ir_vault += 1
+            if is_whitelisted:
+                whitelisted_with_ir += 1
+                
+            ir_vault_id = ir_vault.get("id", "Unknown")
+            ir_name = ""
+            if ir_vault.get("stakeToken"):
+                ir_name = ir_vault["stakeToken"].get("name") or ir_vault["stakeToken"].get("symbol", "")
+            
+            status = "✅ YES"
+            if is_whitelisted:
+                status += " (WL)"
+        else:
+            ir_vault_id = "None"
+            ir_name = ""
+            status = "❌ NO"
+            if is_whitelisted:
+                status += " (WL)"
+        
+        # Truncate long addresses for display
+        display_berachain = vault_addr[:42] if len(vault_addr) > 42 else vault_addr
+        display_ir = ir_vault_id[:42] if len(ir_vault_id) > 42 else ir_vault_id
+        display_berachain_name = vault_name[:28] + "..." if len(vault_name) > 30 else vault_name
+        display_ir_name = ir_name[:28] + "..." if len(ir_name) > 30 else ir_name
+        
+        print(f"{display_berachain:<45} {display_ir:<45} {status:<12} {display_berachain_name:<30} {display_ir_name}")
+    
+    # Print summary statistics
+    print("\n" + "=" * 150)
+    print("=== SUMMARY STATISTICS ===")
+    print(f"Total Berachain RewardVaults: {total_berachain}")
+    print(f"Total Infrared Vaults: {len(infrared_vaults)}")
+    print(f"Berachain vaults with IR coverage: {has_ir_vault} ({has_ir_vault/total_berachain*100:.1f}%)")
+    print(f"Whitelisted Berachain vaults: {whitelisted_total}")
+    print(f"Whitelisted vaults with IR coverage: {whitelisted_with_ir} ({whitelisted_with_ir/whitelisted_total*100:.1f}% of whitelisted)")
+    
+    print(f"\nNote: (WL) indicates whitelisted Berachain vaults")
+
+if __name__ == "__main__":
+    compare_vaults() 
